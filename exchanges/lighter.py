@@ -249,23 +249,105 @@ class LighterClient(BaseExchangeClient):
 
         return best_bid, best_ask
 
-    async def _submit_order_with_retry(self, order_params: Dict[str, Any]) -> OrderResult:
-        """Submit an order with Lighter using official SDK."""
-        # Ensure client is initialized
+    async def _submit_order_with_retry(self, order_params: Dict[str, Any], max_retries: int = 3) -> OrderResult:
+        """Submit an order with Lighter using official SDK with improved retry logic."""
         if self.lighter_client is None:
-            # This is a sync method, so we need to handle this differently
-            # For now, raise an error if client is not initialized
             raise ValueError("Lighter client not initialized. Call connect() first.")
 
-        # Create order using official SDK
-        create_order, tx_hash, error = await self.lighter_client.create_order(**order_params)
-        if error is not None:
-            return OrderResult(
-                success=False, order_id=str(order_params['client_order_index']),
-                error_message=f"Order creation error: {error}")
+        last_error = None
+        
+        for attempt in range(max_retries):
+            try:
+                create_order, tx_hash, error = await self.lighter_client.create_order(**order_params)
+                
+                if error is not None:
+                    return await self._handle_order_error(error, order_params, attempt, max_retries)
+                
+                # Success case
+                return OrderResult(
+                    success=True, 
+                    order_id=str(order_params['client_order_index'])
+                )
 
+            except Exception as e:
+                last_error = e
+                should_retry = await self._handle_exception(e, attempt, max_retries)
+                if not should_retry:
+                    break
+
+        return self._build_failure_result(order_params, max_retries, last_error)
+
+    async def _handle_order_error(self, error: Any, order_params: Dict[str, Any], 
+                                 attempt: int, max_retries: int) -> OrderResult:
+        """Handle order submission errors with appropriate retry logic."""
+        error_str = str(error).lower()
+        
+        # Nonce errors require longer waits for blockchain confirmation
+        if "invalid nonce" in error_str:
+            return await self._handle_nonce_error(error, order_params, attempt, max_retries)
+        
+        # Network errors need quick retries to avoid missing market opportunities
+        elif "cannot connect" in error_str or "connection" in error_str:
+            return await self._handle_network_error(error, order_params, attempt, max_retries)
+        
+        # Other errors should not be retried
         else:
-            return OrderResult(success=True, order_id=str(order_params['client_order_index']))
+            return OrderResult(
+                success=False, 
+                order_id=str(order_params['client_order_index']),
+                error_message=f"Order creation error: {error}"
+            )
+
+    async def _handle_nonce_error(self, error: Any, order_params: Dict[str, Any],
+                                 attempt: int, max_retries: int) -> OrderResult:
+        """Handle nonce errors with longer wait times."""
+        self.logger.log(f"Nonce error detected (attempt {attempt + 1}/{max_retries})", "WARNING")
+        
+        if attempt < max_retries - 1:
+            wait_time = min(2 * (2 ** attempt), 8)  # 2s, 4s, 8s (max 8s)
+            self.logger.log(f"Waiting {wait_time}s before retry due to nonce error", "WARNING")
+            await asyncio.sleep(wait_time)
+        
+        # Return None to continue retry loop
+        return None
+
+    async def _handle_network_error(self, error: Any, order_params: Dict[str, Any],
+                                   attempt: int, max_retries: int) -> OrderResult:
+        """Handle network errors with shorter wait times."""
+        self.logger.log(f"Network connection error (attempt {attempt + 1}/{max_retries})", "WARNING")
+        
+        if attempt < max_retries - 1:
+            wait_time = min(0.5 * (2 ** attempt), 2)  # 0.5s, 1s, 2s (max 2s)
+            self.logger.log(f"Waiting {wait_time}s before retry due to network error", "WARNING")
+            await asyncio.sleep(wait_time)
+        
+        # Return None to continue retry loop
+        return None
+
+    async def _handle_exception(self, exception: Exception, attempt: int, max_retries: int) -> bool:
+        """Handle general exceptions with moderate wait times."""
+        self.logger.log(f"Exception during order submission (attempt {attempt + 1}/{max_retries}): {exception}", "ERROR")
+        
+        if attempt < max_retries - 1:
+            wait_time = min(1 * (2 ** attempt), 4)  # 1s, 2s, 4s (max 4s)
+            self.logger.log(f"Waiting {wait_time}s before retry due to exception", "WARNING")
+            await asyncio.sleep(wait_time)
+            return True  # Continue retry
+        
+        return False  # Stop retry
+
+    def _build_failure_result(self, order_params: Dict[str, Any], max_retries: int, 
+                             last_error: Optional[Exception]) -> OrderResult:
+        """Build failure result after all retries exhausted."""
+        error_msg = f"Failed to submit order after {max_retries} attempts"
+        if last_error:
+            error_msg += f": {last_error}"
+            
+        return OrderResult(
+            success=False,
+            order_id=str(order_params['client_order_index']),
+            error_message=error_msg
+        )
 
     async def place_limit_order(self, contract_id: str, quantity: Decimal, price: Decimal,
                                 side: str) -> OrderResult:

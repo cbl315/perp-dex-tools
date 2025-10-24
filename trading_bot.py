@@ -196,36 +196,67 @@ class TradingBot:
             return 1
 
     async def _place_and_monitor_open_order(self) -> bool:
-        """Place an order and monitor its execution."""
+        """Place an order and monitor its execution with improved error handling."""
         try:
             # Reset state before placing order
             self.order_filled_event.clear()
             self.current_order_status = 'OPEN'
             self.order_filled_amount = 0.0
 
-            # Place the order
-            order_result = await self.exchange_client.place_open_order(
-                self.config.contract_id,
-                self.config.quantity,
-                self.config.direction
-            )
-
-            if not order_result.success:
-                return False
-
-            if order_result.status == 'FILLED':
-                return await self._handle_order_result(order_result)
-            elif not self.order_filled_event.is_set():
+            # Place the order with retry logic
+            max_retries = 3
+            for attempt in range(max_retries):
                 try:
-                    await asyncio.wait_for(self.order_filled_event.wait(), timeout=10)
-                except asyncio.TimeoutError:
-                    pass
+                    order_result = await self.exchange_client.place_open_order(
+                        self.config.contract_id,
+                        self.config.quantity,
+                        self.config.direction
+                    )
 
-            # Handle order result
-            return await self._handle_order_result(order_result)
+                    if not order_result.success:
+                        # Check if we should retry based on error type
+                        error_msg = str(order_result.error_message).lower()
+                        if any(keyword in error_msg for keyword in ['cannot connect', 'connection', 'network', 'timeout']):
+                            if attempt < max_retries - 1:
+                                wait_time = 2 ** attempt  # Exponential backoff
+                                self.logger.log(f"Network error detected, waiting {wait_time}s before retry (attempt {attempt + 1}/{max_retries})", "WARNING")
+                                await asyncio.sleep(wait_time)
+                                continue
+                        # For other errors, don't retry
+                        self.logger.log(f"Order placement failed: {order_result.error_message}", "ERROR")
+                        return False
+
+                    # Order placement successful
+                    if order_result.status == 'FILLED':
+                        return await self._handle_order_result(order_result)
+                    elif not self.order_filled_event.is_set():
+                        try:
+                            await asyncio.wait_for(self.order_filled_event.wait(), timeout=10)
+                        except asyncio.TimeoutError:
+                            pass
+
+                    # Handle order result
+                    return await self._handle_order_result(order_result)
+
+                except Exception as e:
+                    error_msg = str(e).lower()
+                    if any(keyword in error_msg for keyword in ['cannot connect', 'connection', 'network', 'timeout']):
+                        if attempt < max_retries - 1:
+                            wait_time = 2 ** attempt
+                            self.logger.log(f"Network exception detected, waiting {wait_time}s before retry (attempt {attempt + 1}/{max_retries})", "WARNING")
+                            await asyncio.sleep(wait_time)
+                            continue
+                    # For other exceptions, don't retry
+                    self.logger.log(f"Error placing order: {e}", "ERROR")
+                    self.logger.log(f"Traceback: {traceback.format_exc()}", "ERROR")
+                    return False
+
+            # All retries failed
+            self.logger.log(f"Failed to place order after {max_retries} attempts", "ERROR")
+            return False
 
         except Exception as e:
-            self.logger.log(f"Error placing order: {e}", "ERROR")
+            self.logger.log(f"Unexpected error in order placement: {e}", "ERROR")
             self.logger.log(f"Traceback: {traceback.format_exc()}", "ERROR")
             return False
 
