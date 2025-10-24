@@ -30,6 +30,7 @@ class TradingConfig:
     exchange: str
     grid_step: Decimal
     stop_price: Decimal
+    stop_loss_ratio: Decimal
     pause_price: Decimal
     boost_mode: bool
 
@@ -81,6 +82,10 @@ class TradingBot:
         self.order_canceled_event = asyncio.Event()
         self.shutdown_requested = False
         self.loop = None
+        
+        # Stop loss tracking
+        self.position_avg_price = Decimal(0)
+        self.position_size = Decimal(0)
 
         # Register order callback
         self._setup_websocket_handlers()
@@ -446,6 +451,143 @@ class TradingBot:
         else:
             return True
 
+    async def _update_position_tracking(self, position_amt: Decimal):
+        """Update position tracking for stop loss calculation."""
+        if position_amt != self.position_size:
+            # Position changed, update average price
+            if position_amt == 0:
+                # Position closed, reset tracking
+                self.position_avg_price = Decimal(0)
+                self.position_size = Decimal(0)
+            else:
+                # Get current position info to update average price
+                try:
+                    # For simplicity, we'll use the current market price as the new entry price
+                    # In a more sophisticated implementation, you would track each fill separately
+                    best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
+                    current_price = (best_bid + best_ask) / 2
+                    
+                    if self.position_size == 0:
+                        # New position
+                        self.position_avg_price = current_price
+                        self.position_size = position_amt
+                    else:
+                        # Position changed, recalculate average price
+                        # This is a simplified calculation - in practice you'd track each fill
+                        self.position_avg_price = current_price
+                        self.position_size = position_amt
+                        
+                except Exception as e:
+                    self.logger.log(f"Error updating position tracking: {e}", "WARNING")
+
+    async def _execute_stop_loss(self) -> bool:
+        """Execute stop loss by closing the position."""
+        try:
+            self.logger.log(f"Executing stop loss: Closing position of size {self.position_size}", "WARNING")
+            
+            # Determine the side to close the position
+            # For long positions, we need to sell to close
+            # For short positions, we need to buy to close
+            close_side = 'sell' if self.config.direction == 'buy' else 'buy'
+            
+            # Use market order to ensure quick execution
+            close_result = await self.exchange_client.place_market_order(
+                self.config.contract_id,
+                abs(self.position_size),  # Use absolute value for size
+                close_side
+            )
+            
+            if close_result.success:
+                self.logger.log(f"Stop loss executed successfully: Closed {self.position_size} at market price", "WARNING")
+                return True
+            else:
+                self.logger.log(f"Failed to execute stop loss: {close_result.error_message}", "ERROR")
+                return False
+                
+        except Exception as e:
+            self.logger.log(f"Error executing stop loss: {e}", "ERROR")
+            self.logger.log(f"Traceback: {traceback.format_exc()}", "ERROR")
+            return False
+
+    async def _check_stop_loss_condition(self) -> bool:
+        """Check if stop loss condition is triggered."""
+        if self.config.stop_loss_ratio == -1 or self.position_size == 0:
+            return False
+
+        try:
+            best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
+            if best_bid <= 0 or best_ask <= 0 or best_bid >= best_ask:
+                return False
+
+            if self.config.direction == "buy":
+                # For long positions, stop loss triggers when price drops below threshold
+                stop_loss_price = self.position_avg_price * (1 - self.config.stop_loss_ratio / 100)
+                price_diff = best_bid - stop_loss_price
+                price_diff_percent = (price_diff / self.position_avg_price) * 100
+                
+                # Only log every 5th check to reduce frequency (approximately every 5 minutes)
+                current_time = time.time()
+                if not hasattr(self, '_last_stop_loss_log_time'):
+                    self._last_stop_loss_log_time = 0
+                
+                if current_time - self._last_stop_loss_log_time > 300:  # 5 minutes
+                    self.logger.log(f"Stop Loss Check - LONG Position:", "INFO")
+                    self.logger.log(f"  Current Bid Price: {best_bid}", "INFO")
+                    self.logger.log(f"  Stop Loss Price: {stop_loss_price}", "INFO")
+                    self.logger.log(f"  Average Entry Price: {self.position_avg_price}", "INFO")
+                    self.logger.log(f"  Stop Loss Ratio: {self.config.stop_loss_ratio}%", "INFO")
+                    self.logger.log(f"  Distance to Stop Loss: {price_diff:.2f} ({price_diff_percent:.2f}%)", "INFO")
+                    self.logger.log(f"  Position Size: {self.position_size}", "INFO")
+                    self.logger.log(f"  Status: {'ABOVE STOP LOSS' if price_diff > 0 else 'BELOW STOP LOSS'}", "INFO")
+                    self._last_stop_loss_log_time = current_time
+                
+                if best_bid <= stop_loss_price:
+                    self.logger.log(f"STOP LOSS TRIGGERED - LONG POSITION:", "WARNING")
+                    self.logger.log(f"  Current Bid Price: {best_bid}", "WARNING")
+                    self.logger.log(f"  Stop Loss Price: {stop_loss_price}", "WARNING")
+                    self.logger.log(f"  Average Entry Price: {self.position_avg_price}", "WARNING")
+                    self.logger.log(f"  Stop Loss Ratio: {self.config.stop_loss_ratio}%", "WARNING")
+                    self.logger.log(f"  Position Size: {self.position_size}", "WARNING")
+                    self.logger.log(f"  Loss Percentage: {((self.position_avg_price - best_bid) / self.position_avg_price * 100):.2f}%", "WARNING")
+                    return True
+                    
+            elif self.config.direction == "sell":
+                # For short positions, stop loss triggers when price rises above threshold
+                stop_loss_price = self.position_avg_price * (1 + self.config.stop_loss_ratio / 100)
+                price_diff = stop_loss_price - best_ask
+                price_diff_percent = (price_diff / self.position_avg_price) * 100
+                
+                # Only log every 5th check to reduce frequency (approximately every 5 minutes)
+                current_time = time.time()
+                if not hasattr(self, '_last_stop_loss_log_time'):
+                    self._last_stop_loss_log_time = 0
+                
+                if current_time - self._last_stop_loss_log_time > 300:  # 5 minutes
+                    self.logger.log(f"Stop Loss Check - SHORT Position:", "INFO")
+                    self.logger.log(f"  Current Ask Price: {best_ask}", "INFO")
+                    self.logger.log(f"  Stop Loss Price: {stop_loss_price}", "INFO")
+                    self.logger.log(f"  Average Entry Price: {self.position_avg_price}", "INFO")
+                    self.logger.log(f"  Stop Loss Ratio: {self.config.stop_loss_ratio}%", "INFO")
+                    self.logger.log(f"  Distance to Stop Loss: {price_diff:.2f} ({price_diff_percent:.2f}%)", "INFO")
+                    self.logger.log(f"  Position Size: {self.position_size}", "INFO")
+                    self.logger.log(f"  Status: {'BELOW STOP LOSS' if price_diff > 0 else 'ABOVE STOP LOSS'}", "INFO")
+                    self._last_stop_loss_log_time = current_time
+                
+                if best_ask >= stop_loss_price:
+                    self.logger.log(f"STOP LOSS TRIGGERED - SHORT POSITION:", "WARNING")
+                    self.logger.log(f"  Current Ask Price: {best_ask}", "WARNING")
+                    self.logger.log(f"  Stop Loss Price: {stop_loss_price}", "WARNING")
+                    self.logger.log(f"  Average Entry Price: {self.position_avg_price}", "WARNING")
+                    self.logger.log(f"  Stop Loss Ratio: {self.config.stop_loss_ratio}%", "WARNING")
+                    self.logger.log(f"  Position Size: {self.position_size}", "WARNING")
+                    self.logger.log(f"  Loss Percentage: {((best_ask - self.position_avg_price) / self.position_avg_price * 100):.2f}%", "WARNING")
+                    return True
+
+        except Exception as e:
+            self.logger.log(f"Error checking stop loss condition: {e}", "ERROR")
+            
+        return False
+
     async def _check_price_condition(self) -> bool:
         stop_trading = False
         pause_trading = False
@@ -533,6 +675,44 @@ class TradingBot:
 
                 # Periodic logging
                 mismatch_detected = await self._log_status_periodically()
+
+                # Update position tracking for stop loss
+                position_amt = await self.exchange_client.get_account_positions()
+                await self._update_position_tracking(position_amt)
+
+                # Check stop loss condition (only log every 5 minutes to reduce frequency)
+                current_time = time.time()
+                if not hasattr(self, '_last_stop_loss_check_time'):
+                    self._last_stop_loss_check_time = 0
+                
+                # Only check stop loss condition every 30 seconds to reduce frequency
+                if current_time - self._last_stop_loss_check_time > 30:
+                    self._last_stop_loss_check_time = current_time
+                    stop_loss_triggered = await self._check_stop_loss_condition()
+                else:
+                    stop_loss_triggered = False
+                    
+                if stop_loss_triggered:
+                    msg = f"\n\nWARNING: [{self.config.exchange.upper()}_{self.config.ticker.upper()}] \n"
+                    msg += f"Stop loss triggered at {self.config.stop_loss_ratio}% loss\n"
+                    msg += f"止损触发，亏损达到{self.config.stop_loss_ratio}%\n"
+                    msg += f"Position size: {self.position_size}, Average price: {self.position_avg_price}\n"
+                    msg += "Executing stop loss by closing position...\n"
+                    msg += "正在执行止损平仓...\n"
+                    await self.send_notification(msg.lstrip())
+                    
+                    # Execute stop loss by closing the position
+                    stop_loss_executed = await self._execute_stop_loss()
+                    if stop_loss_executed:
+                        msg = f"Stop loss executed successfully. Position closed.\n"
+                        msg += f"止损执行成功，仓位已平仓。\n"
+                    else:
+                        msg = f"Failed to execute stop loss. Manual intervention required.\n"
+                        msg += f"止损执行失败，需要手动干预。\n"
+                    
+                    await self.send_notification(msg)
+                    await self.graceful_shutdown("Stop loss triggered and executed")
+                    continue
 
                 stop_trading, pause_trading = await self._check_price_condition()
                 if stop_trading:
