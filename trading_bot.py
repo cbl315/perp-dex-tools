@@ -707,7 +707,7 @@ class TradingBot:
             mismatch_amount = position_amt - active_close_amount
             
             # Check if rebalancing is needed (10% tolerance)
-            tolerance = self.config.quantity * Decimal('0.1')
+            tolerance = self.config.quantity * Decimal('0.25')
             if abs(mismatch_amount) <= tolerance:
                 return False
                 
