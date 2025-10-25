@@ -3,6 +3,7 @@ Modular Trading Bot - Supports multiple exchanges
 """
 
 import os
+import sys
 import time
 import asyncio
 import traceback
@@ -86,11 +87,14 @@ class TradingBot:
         # Stop loss tracking
         self.position_avg_price = Decimal(0)
         self.position_size = Decimal(0)
+        
+        # Auto-rebalance tracking
+        self._last_rebalance_time = 0
 
         # Register order callback
         self._setup_websocket_handlers()
 
-    async def graceful_shutdown(self, reason: str = "Unknown"):
+    async def graceful_shutdown(self, reason: str = "Unknown", exit_code: int = 1):
         """Perform graceful shutdown of the trading bot."""
         self.logger.log(f"Starting graceful shutdown: {reason}", "INFO")
         self.shutdown_requested = True
@@ -102,6 +106,9 @@ class TradingBot:
 
         except Exception as e:
             self.logger.log(f"Error during graceful shutdown: {e}", "ERROR")
+        
+        # Exit with appropriate exit code
+        sys.exit(exit_code)
 
     def _setup_websocket_handlers(self):
         """Setup WebSocket handlers for order updates."""
@@ -660,6 +667,202 @@ class TradingBot:
             with TelegramBot(telegram_token, telegram_chat_id) as tg_bot:
                 tg_bot.send_text(message)
 
+    async def _retry_network_connection(self, max_retries: int = 3) -> bool:
+        """Try to re-establish network connection with exponential backoff."""
+        for attempt in range(max_retries):
+            try:
+                # Simple network check - try to fetch prices
+                await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
+                self.logger.log(f"Network connection recovered after {attempt + 1} attempts", "INFO")
+                return True
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    wait_time = 5 * (attempt + 1)  # 5s, 10s, 15s
+                    self.logger.log(f"Network still unavailable, waiting {wait_time}s before retry...", "WARNING")
+                    await asyncio.sleep(wait_time)
+                else:
+                    self.logger.log(f"Network connection failed after {max_retries} attempts: {e}", "ERROR")
+        return False
+
+    async def _auto_rebalance_position(self):
+        """Automatically rebalance position and orders when mismatch detected."""
+        try:
+            # Avoid frequent rebalancing (minimum 5 minutes between rebalances)
+            current_time = time.time()
+            if current_time - self._last_rebalance_time < 300:  # 5 minutes
+                return False
+                
+            # Get real-time data
+            position_amt = await self.exchange_client.get_account_positions()
+            active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
+            
+            # Calculate active close orders amount
+            active_close_amount = sum(
+                Decimal(order.size) 
+                for order in active_orders 
+                if order.side == self.config.close_order_side
+            )
+            
+            # Calculate mismatch amount
+            mismatch_amount = position_amt - active_close_amount
+            
+            # Check if rebalancing is needed (10% tolerance)
+            tolerance = self.config.quantity * Decimal('0.1')
+            if abs(mismatch_amount) <= tolerance:
+                return False
+                
+            # Limit rebalance amount (max 3x single trade quantity)
+            max_rebalance_amount = self.config.quantity * 3
+            if abs(mismatch_amount) > max_rebalance_amount:
+                self.logger.log(f"Mismatch too large for auto-rebalance: {mismatch_amount}", "WARNING")
+                return False
+            
+            self.logger.log(f"Auto-rebalancing: Position={position_amt}, Close orders={active_close_amount}, Mismatch={mismatch_amount}", "WARNING")
+            
+            if mismatch_amount > 0:
+                # Position > Close orders, need to add close orders
+                success = await self._add_close_orders(mismatch_amount)
+            else:
+                # Position < Close orders, need to cancel excess orders
+                success = await self._cancel_excess_orders(abs(mismatch_amount))
+            
+            if success:
+                self._last_rebalance_time = current_time
+                self.logger.log("Auto-rebalance completed successfully", "INFO")
+                return True
+            else:
+                self.logger.log("Auto-rebalance failed", "ERROR")
+                return False
+                
+        except Exception as e:
+            self.logger.log(f"Auto-rebalance error: {e}", "ERROR")
+            return False
+
+    async def _add_close_orders(self, amount_to_add: Decimal):
+        """Add close orders to match position."""
+        try:
+            self.logger.log(f"Adding close orders for {amount_to_add} to rebalance position", "INFO")
+            
+            # Get current market prices
+            best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
+            
+            # Calculate close price based on strategy
+            if self.config.direction == "buy":
+                # Long strategy: close price = ask price * (1 + take_profit%)
+                close_price = best_ask * (1 + self.config.take_profit/100)
+            else:
+                # Short strategy: close price = bid price * (1 - take_profit%)
+                close_price = best_bid * (1 - self.config.take_profit/100)
+            
+            # Place close order
+            close_side = self.config.close_order_side
+            order_result = await self.exchange_client.place_close_order(
+                self.config.contract_id,
+                amount_to_add,
+                close_price,
+                close_side
+            )
+            
+            if order_result.success:
+                self.logger.log(f"Successfully added close order: {amount_to_add} @ {close_price}", "INFO")
+                return True
+            else:
+                self.logger.log(f"Failed to add close order: {order_result.error_message}", "ERROR")
+                return False
+                
+        except Exception as e:
+            self.logger.log(f"Error adding close orders: {e}", "ERROR")
+            return False
+
+    async def _cancel_excess_orders(self, amount_to_cancel: Decimal):
+        """Cancel excess close orders to match position."""
+        try:
+            self.logger.log(f"Cancelling excess orders for {amount_to_cancel} to rebalance position", "INFO")
+            
+            # Get active close orders
+            active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
+            close_orders = [order for order in active_orders if order.side == self.config.close_order_side]
+            
+            # Sort orders by price (for long strategy cancel highest prices, for short strategy cancel lowest prices)
+            if self.config.direction == "buy":
+                close_orders.sort(key=lambda o: o.price, reverse=True)  # Highest prices first
+            else:
+                close_orders.sort(key=lambda o: o.price)  # Lowest prices first
+            
+            # Cancel orders until target amount is reached
+            cancelled_amount = Decimal(0)
+            for order in close_orders:
+                if cancelled_amount >= amount_to_cancel:
+                    break
+                    
+                # Cancel order
+                cancel_result = await self.exchange_client.cancel_order(order.order_id)
+                if cancel_result.success:
+                    cancelled_amount += order.size
+                    self.logger.log(f"Cancelled order {order.order_id}: {order.size} @ {order.price}", "INFO")
+                else:
+                    self.logger.log(f"Failed to cancel order {order.order_id}: {cancel_result.error_message}", "WARNING")
+            
+            self.logger.log(f"Cancelled {cancelled_amount} in excess orders", "INFO")
+            return cancelled_amount >= amount_to_cancel
+            
+        except Exception as e:
+            self.logger.log(f"Error cancelling excess orders: {e}", "ERROR")
+            return False
+
+    async def _restore_trading_state(self):
+        """Restore trading state after program restart with network retry."""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                self.logger.log("Restoring trading state after restart...", "INFO")
+                
+                # Get current position
+                position_amt = await self.exchange_client.get_account_positions()
+                self.position_size = position_amt
+                
+                # Get active orders
+                active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
+                
+                # Rebuild close orders list
+                self.active_close_orders = []
+                for order in active_orders:
+                    if order.side == self.config.close_order_side:
+                        self.active_close_orders.append({
+                            'id': order.order_id,
+                            'price': order.price,
+                            'size': order.size
+                        })
+                
+                # Rebuild last_close_orders count
+                self.last_close_orders = len(self.active_close_orders)
+                
+                # Rebuild position tracking (simplified - use current market price as average)
+                if position_amt != 0:
+                    try:
+                        best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
+                        self.position_avg_price = (best_bid + best_ask) / 2
+                    except Exception as e:
+                        self.logger.log(f"Failed to get market price for position tracking: {e}", "WARNING")
+                        # Use a safe default
+                        self.position_avg_price = Decimal(0)
+                
+                self.logger.log(f"State restored: Position={position_amt}, Close orders={len(self.active_close_orders)}", "INFO")
+                return
+                
+            except ConnectionError as e:
+                if attempt < max_retries - 1:
+                    wait_time = 5 * (attempt + 1)  # 5s, 10s, 15s
+                    self.logger.log(f"Network error during state restore (attempt {attempt + 1}/{max_retries}), waiting {wait_time}s...", "WARNING")
+                    await asyncio.sleep(wait_time)
+                else:
+                    self.logger.log(f"Failed to restore trading state after {max_retries} attempts: {e}", "ERROR")
+                    raise
+            except Exception as e:
+                # For non-network errors, don't retry
+                self.logger.log(f"Failed to restore trading state: {e}", "ERROR")
+                raise
+
     async def run(self):
         """Main trading loop."""
         try:
@@ -689,6 +892,9 @@ class TradingBot:
             # wait for connection to establish
             await asyncio.sleep(5)
 
+            # Restore trading state after restart
+            await self._restore_trading_state()
+
             # Main trading loop
             while not self.shutdown_requested:
                 # Update active orders
@@ -704,12 +910,15 @@ class TradingBot:
                             'size': order.size
                         })
 
-                # Periodic logging
-                mismatch_detected = await self._log_status_periodically()
-
                 # Update position tracking for stop loss
                 position_amt = await self.exchange_client.get_account_positions()
                 await self._update_position_tracking(position_amt)
+
+                # Try auto-rebalance first
+                rebalanced = await self._auto_rebalance_position()
+                
+                # Periodic logging
+                mismatch_detected = await self._log_status_periodically()
 
                 # Check stop loss condition (only log every 5 minutes to reduce frequency)
                 current_time = time.time()
@@ -742,7 +951,8 @@ class TradingBot:
                         msg += f"止损执行失败，需要手动干预。\n"
                     
                     await self.send_notification(msg)
-                    await self.graceful_shutdown("Stop loss triggered and executed")
+                    # Exit with code 0 to prevent auto-restart
+                    await self.graceful_shutdown("Stop loss triggered and executed", exit_code=0)
                     continue
 
                 stop_trading, pause_trading = await self._check_price_condition()
@@ -751,7 +961,8 @@ class TradingBot:
                     msg += "Stopped trading due to stop price triggered\n"
                     msg += "价格已经达到停止交易价格，脚本将停止交易\n"
                     await self.send_notification(msg.lstrip())
-                    await self.graceful_shutdown(msg)
+                    # Exit with code 0 to prevent auto-restart
+                    await self.graceful_shutdown(msg, exit_code=0)
                     continue
 
                 if pause_trading:
@@ -776,6 +987,18 @@ class TradingBot:
         except KeyboardInterrupt:
             self.logger.log("Bot stopped by user")
             await self.graceful_shutdown("User interruption (Ctrl+C)")
+        except ConnectionError as e:
+            # Network error: try to reconnect before shutting down
+            self.logger.log(f"Network connection error: {e}", "WARNING")
+            self.logger.log("Attempting to re-establish network connection...", "WARNING")
+            
+            if await self._retry_network_connection():
+                self.logger.log("Network connection recovered, continuing trading", "INFO")
+                # Continue running instead of shutting down
+                return await self.run()
+            else:
+                self.logger.log("Failed to re-establish network connection after retries", "ERROR")
+                await self.graceful_shutdown(f"Network error: {e}", exit_code=1)
         except Exception as e:
             self.logger.log(f"Critical error: {e}", "ERROR")
             self.logger.log(f"Traceback: {traceback.format_exc()}", "ERROR")

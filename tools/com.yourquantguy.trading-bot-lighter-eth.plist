@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.yourquantguy.trading-bot-lighter-eth</string>
+    
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/caibiliang/.local/bin/uv</string>
+        <string>run</string>
+        <string>python</string>
+        <string>/Users/caibiliang/code/github.com/your-quantguy/perp-dex-tools/runbot.py</string>
+        <string>--exchange</string>
+        <string>lighter</string>
+        <string>--ticker</string>
+        <string>ETH</string>
+        <string>--quantity</string>
+        <string>0.1</string>
+        <string>--take-profit</string>
+        <string>0.02</string>
+        <string>--max-orders</string>
+        <string>40</string>
+        <string>--wait-time</string>
+        <string>450</string>
+        <string>--stop-loss-ratio</string>
+        <string>8</string>
+
+    </array>
+    
+    <key>WorkingDirectory</key>
+    <string>/Users/caibiliang/code/github.com/your-quantguy/perp-dex-tools</string>
+    
+    <key>StandardOutPath</key>
+    <string>/Users/caibiliang/code/github.com/your-quantguy/perp-dex-tools/logs/trading-bot.log</string>
+    
+    <key>StandardErrorPath</key>
+    <string>/Users/caibiliang/code/github.com/your-quantguy/perp-dex-tools/logs/trading-bot-error.log</string>
+    
+    <key>KeepAlive</key>
+    <dict>
+        <!-- 只在退出码为1时重启（技术异常） -->
+        <key>SuccessfulExit</key>
+        <false/>
+        
+        <!-- 指定只在退出码为1时重启 -->
+        <key>ExitCodes</key>
+        <array>
+            <integer>1</integer>
+        </array>
+    </dict>
+    
+    <key>RunAtLoad</key>
+    <true/>
+    
+    <key>StartInterval</key>
+    <integer>10</integer>
+    
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    
+    <!-- 环境变量 -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONPATH</key>
+        <string>/Users/caibiliang/code/github.com/your-quantguy/perp-dex-tools</string>
+    </dict>
+</dict>
+</plist>

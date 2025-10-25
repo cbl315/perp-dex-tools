@@ -544,29 +544,40 @@ class LighterClient(BaseExchangeClient):
 
     async def get_active_orders(self, contract_id: str) -> List[OrderInfo]:
         """Get active orders for a contract using official SDK."""
-        order_list = await self._fetch_orders_with_retry()
+        try:
+            order_list = await self._fetch_orders_with_retry()
+            
+            # Handle case where order_list is None (network failure)
+            if order_list is None:
+                self.logger.log("Network failure - unable to fetch orders", "WARNING")
+                raise ConnectionError("Network failure - unable to fetch orders")
 
-        # Filter orders for the specific market
-        contract_orders = []
-        for order in order_list:
-            # Convert Lighter Order to OrderInfo
-            side = "sell" if order.is_ask else "buy"
-            size = Decimal(order.initial_base_amount)
-            price = Decimal(order.price)
+            # Filter orders for the specific market
+            contract_orders = []
+            for order in order_list:
+                # Convert Lighter Order to OrderInfo
+                side = "sell" if order.is_ask else "buy"
+                size = Decimal(order.initial_base_amount)
+                price = Decimal(order.price)
 
-            # Only include orders with remaining size > 0
-            if size > 0:
-                contract_orders.append(OrderInfo(
-                    order_id=str(order.order_index),
-                    side=side,
-                    size=Decimal(order.remaining_base_amount),  # FIXME: This is wrong. Should be size
-                    price=price,
-                    status=order.status.upper(),
-                    filled_size=Decimal(order.filled_base_amount),
-                    remaining_size=Decimal(order.remaining_base_amount)
-                ))
+                # Only include orders with remaining size > 0
+                if size > 0:
+                    contract_orders.append(OrderInfo(
+                        order_id=str(order.order_index),
+                        side=side,
+                        size=Decimal(order.remaining_base_amount),  # FIXME: This is wrong. Should be size
+                        price=price,
+                        status=order.status.upper(),
+                        filled_size=Decimal(order.filled_base_amount),
+                        remaining_size=Decimal(order.remaining_base_amount)
+                    ))
 
-        return contract_orders
+            return contract_orders
+            
+        except Exception as e:
+            self.logger.log(f"Error getting active orders: {e}", "ERROR")
+            # Re-raise the exception to be handled by the main loop
+            raise
 
     @query_retry(reraise=True)
     async def _fetch_positions_with_retry(self) -> List[Dict[str, Any]]:
