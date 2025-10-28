@@ -739,20 +739,59 @@ class TradingBot:
             return False
 
     async def _add_close_orders(self, amount_to_add: Decimal):
-        """Add close orders to match position."""
+        """Add close orders to match position with price optimization and slippage protection."""
         try:
             self.logger.log(f"Adding close orders for {amount_to_add} to rebalance position", "INFO")
             
             # Get current market prices
             best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
             
-            # Calculate close price based on strategy
+            # Calculate base close price based on strategy
             if self.config.direction == "buy":
                 # Long strategy: close price = ask price * (1 + take_profit%)
-                close_price = best_ask * (1 + self.config.take_profit/100)
+                base_close_price = best_ask * (1 + self.config.take_profit/100)
             else:
                 # Short strategy: close price = bid price * (1 - take_profit%)
-                close_price = best_bid * (1 - self.config.take_profit/100)
+                base_close_price = best_bid * (1 - self.config.take_profit/100)
+            
+            # Price optimization: only when grid_step > 0
+            if self.config.grid_step > 0:
+                # Get existing close orders to avoid price concentration
+                active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
+                close_orders = [order for order in active_orders if order.side == self.config.close_order_side]
+                
+                if close_orders:
+                    existing_prices = [order.price for order in close_orders]
+                    avg_price = sum(existing_prices) / len(existing_prices)
+                    
+                    if self.config.direction == "buy":
+                        # For long strategy, ensure new order is not too close to existing orders
+                        min_price_gap = avg_price * (self.config.grid_step / 200)  # Half of grid step
+                        optimized_price = max(base_close_price, avg_price + min_price_gap)
+                    else:
+                        # For short strategy, ensure new order is not too close to existing orders
+                        min_price_gap = avg_price * (self.config.grid_step / 200)  # Half of grid step
+                        optimized_price = min(base_close_price, avg_price - min_price_gap)
+                else:
+                    # No existing orders, use base price
+                    optimized_price = base_close_price
+            else:
+                # If grid_step is invalid (<= 0), use base price without optimization
+                optimized_price = base_close_price
+            
+            # Slippage protection: ensure minimum price gap from current market
+            if self.config.direction == "buy":
+                min_slippage_gap = best_ask * Decimal('0.001')  # 0.1% minimum gap
+                close_price = max(optimized_price, best_ask + min_slippage_gap)
+            else:
+                min_slippage_gap = best_bid * Decimal('0.001')  # 0.1% minimum gap
+                close_price = min(optimized_price, best_bid - min_slippage_gap)
+            
+            # Round to tick size
+            close_price = self._round_to_tick(close_price)
+            
+            self.logger.log(f"Price optimization: Base={base_close_price:.4f}, "
+                           f"Optimized={optimized_price:.4f}, Final={close_price:.4f}", "INFO")
             
             # Place close order
             close_side = self.config.close_order_side
@@ -764,7 +803,7 @@ class TradingBot:
             )
             
             if order_result.success:
-                self.logger.log(f"Successfully added close order: {amount_to_add} @ {close_price}", "INFO")
+                self.logger.log(f"Successfully added close order: {amount_to_add} @ {close_price:.4f}", "INFO")
                 return True
             else:
                 self.logger.log(f"Failed to add close order: {order_result.error_message}", "ERROR")
@@ -783,11 +822,13 @@ class TradingBot:
             active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
             close_orders = [order for order in active_orders if order.side == self.config.close_order_side]
             
-            # Sort orders by price (for long strategy cancel highest prices, for short strategy cancel lowest prices)
+            # Sort orders by price (for long strategy cancel lowest prices, for short strategy cancel highest prices)
             if self.config.direction == "buy":
-                close_orders.sort(key=lambda o: o.price, reverse=True)  # Highest prices first
-            else:
+                # For long strategy: cancel lowest prices first (least likely to be filled)
                 close_orders.sort(key=lambda o: o.price)  # Lowest prices first
+            else:
+                # For short strategy: cancel highest prices first (least likely to be filled)
+                close_orders.sort(key=lambda o: o.price, reverse=True)  # Highest prices first
             
             # Cancel orders until target amount is reached
             cancelled_amount = Decimal(0)
@@ -809,6 +850,15 @@ class TradingBot:
         except Exception as e:
             self.logger.log(f"Error cancelling excess orders: {e}", "ERROR")
             return False
+
+    def _round_to_tick(self, price: Decimal) -> Decimal:
+        """Round price to the nearest tick size."""
+        if self.config.tick_size <= 0:
+            return price
+        
+        tick_size = self.config.tick_size
+        rounded_price = round(price / tick_size) * tick_size
+        return rounded_price
 
     async def _restore_trading_state(self):
         """Restore trading state after program restart with network retry."""

@@ -16,7 +16,7 @@
         <string>--ticker</string>
         <string>ETH</string>
         <string>--quantity</string>
-        <string>0.1</string>
+        <string>0.05</string>
         <string>--take-profit</string>
         <string>0.02</string>
         <string>--max-orders</string>
@@ -41,7 +41,7 @@
     <dict>
         <!-- 只在退出码为1时重启（技术异常） -->
         <key>SuccessfulExit</key>
-        <false/>
+    <false/>
         
         <!-- 指定只在退出码为1时重启 -->
         <key>ExitCodes</key>
